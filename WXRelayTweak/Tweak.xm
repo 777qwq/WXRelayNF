@@ -1199,6 +1199,67 @@ static void WXProbeAppend(NSString *line) {
     } @catch (NSException *e) { }
 }
 
+// ===== v0.24：激活事件钩子（事件流替代状态轮询） =====
+static void WXProbeEvt(NSString *what, NSString *bid) {
+    WXProbeAppend([NSString stringWithFormat:@"EVT %@ %@\n", what, bid ?: @"-"]);
+}
+
+static void WXProbeHookActivation(void) {
+    @try {
+        // A. frontmost 端口更新：frontmost 切换瞬间必调，无参安全
+        Class ws = objc_getClass("SBMainWorkspace");
+        SEL port = NSSelectorFromString(@"_updateFrontMostApplicationEventPort");
+        if (ws) {
+            Method m = class_getInstanceMethod(ws, port);
+            if (m) {
+                IMP orig = method_getImplementation(m);
+                IMP blk = imp_implementationWithBlock(^(id self2) {
+                    @try {
+                        // 事件瞬间快照全部候选（此时状态最诚实）
+                        WXProbeEvt(@"port", WXProbeKVC(@"SBMainWorkspace", @"mainScreenAppLayout"));
+                    } @catch (NSException *e) { }
+                    ((void(*)(id,SEL))orig)(self2, port);
+                });
+                method_setImplementation(m, blk);
+                WXProbeAppend(@"hook: _updateFrontMostApplicationEventPort armed\n");
+            } else WXProbeAppend(@"hook: port method absent\n");
+        }
+        // B. SBApplication 激活相关 setter：确认存在+签名安全才挂钩
+        Class appCls = objc_getClass("SBApplication");
+        if (appCls) {
+            unsigned int n = 0; Method *ms = class_copyMethodList(appCls, &n);
+            int armed = 0;
+            for (unsigned int i = 0; i < n && armed < 4; i++) {
+                SEL s = method_getName(ms[i]);
+                NSString *nm = NSStringFromSelector(s);
+                if (![nm hasPrefix:@"set"] || ![nm.lowercaseString containsString:@"ctivat"]) continue;
+                if (method_getNumberOfArguments(ms[i]) != 3) continue;
+                char at = method_copyArgumentType(ms[i], 2)[0];
+                if (at != '@' && at != 'c' && at != 'B') continue;
+                Method m = ms[i];
+                IMP orig = method_getImplementation(m);
+                __block SEL selKeep = s;
+                __block IMP origKeep = orig;
+                IMP blk = imp_implementationWithBlock(^(id self2, id v) {
+                    @try {
+                        id b = [(id)self2 valueForKey:@"bundleIdentifier"];
+                        if ([b isKindOfClass:[NSString class]])
+                            WXProbeEvt([NSString stringWithFormat:@"app %@", nm], b);
+                    } @catch (NSException *e) { }
+                    if (at == '@') ((void(*)(id,SEL,id))origKeep)(self2, selKeep, v);
+                    else ((void(*)(id,SEL,char))(intptr_t)origKeep)(self2, selKeep, (char)(intptr_t)v);
+                });
+                method_setImplementation(m, blk);
+                armed++;
+                WXProbeAppend([NSString stringWithFormat:@"hook: SBApplication %@ armed\n", nm]);
+            }
+            WXProbeAppend([NSString stringWithFormat:@"hook: app setters armed=%d\n", armed]);
+        }
+    } @catch (NSException *e) {
+        WXProbeAppend([NSString stringWithFormat:@"hook EXC %@\n", e.name]);
+    }
+}
+
 static void WXProbeSnapCycle(void) {
     @try {
         static NSDateFormatter *df = nil;
@@ -1441,8 +1502,9 @@ static void WXFrontmostPollCycle(void) {
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            WXProbeAppend(@"=== 0.23 probe start ===\n");
-            WXProbeSnapCycle(); // v0.23 探针：每秒快照
+            WXProbeAppend(@"=== 0.24 probe start ===\n");
+            WXProbeHookActivation(); // v0.24：激活事件钩子
+            WXProbeSnapCycle(); // 每秒快照保留
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{

@@ -302,9 +302,34 @@ static void WRProbeAppend(NSString *line) {
     } @catch (NSException *e) { }
 }
 
+// ===== v0.24 帧流探针：后台 app 的 display link 被 iOS 停调，
+// 若切走后帧断流，"帧流活着"=真前台（Immortalizer 伪造不了 render server） =====
+@interface WRFrameTap : NSObject
+@property (nonatomic, assign) int frames;
+@end
+@implementation WRFrameTap
+- (void)tick:(CADisplayLink *)dl { _frames++; }
+@end
+
+static WRFrameTap *WRFrameTapInst = nil;
+
+static void WRProbeFrameStart(void) {
+    if (WRFrameTapInst) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (WRFrameTapInst) return;
+        WRFrameTapInst = [[WRFrameTap alloc] init];
+        Class dlc = objc_getClass("CADisplayLink");
+        if (!dlc) { WRProbeAppend(@"frame: no CADisplayLink"); return; }
+        CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:WRFrameTapInst selector:@selector(tick:)];
+        if (!dl) { WRProbeAppend(@"frame: no displayLink"); return; }
+        [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        WRProbeAppend(@"frame: displayLink armed (commonModes)");
+    });
+}
+
 static void WRProbeStart(void) {
     @try {
-        WRProbeAppend(@"=== 0.23 wx probe start ===");
+        WRProbeAppend(@"=== 0.24 wx probe start ===");
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         for (NSString *nm in @[@"UIApplicationWillResignActiveNotification",
                                @"UIApplicationDidBecomeActiveNotification",
@@ -328,7 +353,9 @@ static void WRProbeStart(void) {
                     if (scene) {
                         @try { sc = [(NSNumber *)[scene valueForKey:@"activationState"] longValue]; } @catch (NSException *e) { sc = -8; }
                     }
-                    WRProbeAppend([NSString stringWithFormat:@"SNAP appState=%ld sceneAct=%ld", st, sc]);
+                    long fr = -1;
+                    @try { fr = WRFrameTapInst.frames; WRFrameTapInst.frames = 0; } @catch (NSException *e) { }
+                    WRProbeAppend([NSString stringWithFormat:@"SNAP appState=%ld sceneAct=%ld frames2s=%ld", st, sc, fr]);
                 } @catch (NSException *e) { }
             });
             dispatch_resume(t);
@@ -704,7 +731,8 @@ __attribute__((constructor)) static void wxrelaySenderCtor(void) {
             WRResolveSelfWxid(); // 等微信联系人服务就绪
             WRReportScenePIDToFile(); // v0.8 保活：场景就绪后立即上报
             WRInstallTouchHook(); // v0.22 触摸真值
-            WRProbeStart(); // v0.23 探针：场景真值记录
+            WRProbeStart(); // 探针：场景真值记录
+            WRProbeFrameStart(); // v0.24：帧流探针
             WRAddWillPresent(); // 模块C：delegate 已注册，就地装载
         });
         // v0.8 保活：每次回前台刷新场景 ID 文件（场景会话可能变化）
