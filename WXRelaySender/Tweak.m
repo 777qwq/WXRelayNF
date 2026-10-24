@@ -280,35 +280,13 @@ static void WRTaskNotifyCallback(CFNotificationCenterRef __unused c, void __unus
 // v0.3 banner: post local notification when in background (UILocalNotification)
 // v0.16：UN 请求通道（原生头像/点击直达），前台判定读 SB 写的共享文件
 // （applicationState 被 Immortalizer 伪造成 Active，不可信——0.15 实测门禁全灭）
-// ===== v0.23 探针：UIKit 场景层真值记录（通知流+2s 快照） =====
-static NSMutableString *WRProbeLog = nil;
-
-static void WRProbeFlush(void) {
-    @try {
-        if (!WRProbeLog) return;
-        NSString *fp2 = [[NSTemporaryDirectory() stringByAppendingPathComponent:@"wxrelay_probe_wx.txt"] copy];
-        [WRProbeLog writeToFile:fp2 atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    } @catch (NSException *e) { }
-}
-
-static void WRProbeAppend(NSString *line) {
-    @try {
-        static NSDateFormatter *df = nil;
-        if (!df) { df = [NSDateFormatter new]; df.dateFormat = @"HH:mm:ss"; }
-        if (!WRProbeLog) WRProbeLog = [NSMutableString new];
-        [WRProbeLog appendFormat:@"%@ %@\n", [df stringFromDate:[NSDate date]], line];
-        if (WRProbeLog.length > 14000) [WRProbeLog deleteCharactersInRange:NSMakeRange(0, 7000)];
-        WRProbeFlush();
-    } @catch (NSException *e) { }
-}
-
 // ===== v0.24 帧流探针：后台 app 的 display link 被 iOS 停调，
 // 若切走后帧断流，"帧流活着"=真前台（Immortalizer 伪造不了 render server） =====
 @interface WRFrameTap : NSObject
-@property (nonatomic, assign) int frames;
+@property (nonatomic, assign) NSTimeInterval lastFrameAt; // v0.25 前台真值：最近一帧时刻
 @end
 @implementation WRFrameTap
-- (void)tick:(CADisplayLink *)dl { _frames++; }
+- (void)tick:(CADisplayLink *)dl { _lastFrameAt = [[NSDate date] timeIntervalSince1970]; }
 @end
 
 static WRFrameTap *WRFrameTapInst = nil;
@@ -319,78 +297,21 @@ static void WRProbeFrameStart(void) {
         if (WRFrameTapInst) return;
         WRFrameTapInst = [[WRFrameTap alloc] init];
         Class dlc = objc_getClass("CADisplayLink");
-        if (!dlc) { WRProbeAppend(@"frame: no CADisplayLink"); return; }
+        if (!dlc) { wrLog(@"frame: no CADisplayLink"); return; }
         CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:WRFrameTapInst selector:@selector(tick:)];
-        if (!dl) { WRProbeAppend(@"frame: no displayLink"); return; }
+        if (!dl) { wrLog(@"frame: no displayLink"); return; }
         [dl addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-        WRProbeAppend(@"frame: displayLink armed (commonModes)");
+        wrLog(@"frame: displayLink armed");
     });
 }
 
-static void WRProbeStart(void) {
-    @try {
-        WRProbeAppend(@"=== 0.24 wx probe start ===");
-        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        for (NSString *nm in @[@"UIApplicationWillResignActiveNotification",
-                               @"UIApplicationDidBecomeActiveNotification",
-                               @"UIApplicationWillEnterForegroundNotification",
-                               @"UIApplicationDidEnterBackgroundNotification"]) {
-            [nc addObserverForName:nm object:nil queue:nil usingBlock:^(NSNotification *note) {
-                WRProbeAppend([NSString stringWithFormat:@"EVT %@", nm]);
-            }];
-        }
-        dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
-        if (t) {
-            dispatch_source_set_timer(t, DISPATCH_TIME_NOW, 2.0 * NSEC_PER_SEC, 1.0 * NSEC_PER_SEC);
-            dispatch_source_set_event_handler(t, ^{
-                @try {
-                    UIApplication *app = [UIApplication sharedApplication];
-                    id scene = nil;
-                    long st = -1, sc = -9;
-                    @try { st = (long)app.applicationState; } @catch (NSException *e) { st = -2; }
-                    @try { scene = [app valueForKey:@"keyWindowScene"]; } @catch (NSException *e) { }
-                    if (scene) {
-                        @try { sc = [(NSNumber *)[scene valueForKey:@"activationState"] longValue]; } @catch (NSException *e) { sc = -8; }
-                    }
-                    long fr = -1;
-                    @try { fr = WRFrameTapInst.frames; WRFrameTapInst.frames = 0; } @catch (NSException *e) { }
-                    WRProbeAppend([NSString stringWithFormat:@"SNAP appState=%ld sceneAct=%ld frames2s=%ld", st, sc, fr]);
-                } @catch (NSException *e) { }
-            });
-            dispatch_resume(t);
-        }
-    } @catch (NSException *e) { }
-}
 
-// v0.22 触摸真值：Immortalizer 把系统侧"微信前台状态"全伪造，唯一幸存真值=触摸事件
-// 只流向用户正在看的 app。sendEvent 记录最后触摸时间。
-static NSTimeInterval WRLastTouchAt = 0;
-
-static void WRInstallTouchHook(void) {
-    @try {
-        Class c = objc_getClass("UIApplication");
-        SEL s = @selector(sendEvent:);
-        Method m = class_getInstanceMethod(c, s);
-        if (!m) { wrLog(@"touch hook: no sendEvent"); return; }
-        IMP orig = method_getImplementation(m);
-        IMP blk = imp_implementationWithBlock(^(id self2, UIEvent *event) {
-            @try {
-                if (event.allTouches.count > 0)
-                    WRLastTouchAt = [[NSDate date] timeIntervalSince1970];
-            } @catch (NSException *e) { }
-            ((void(*)(id,SEL,UIEvent*))orig)(self2, @selector(sendEvent:), event);
-        });
-        method_setImplementation(m, blk);
-        wrLog(@"touch hook installed (sendEvent)");
-    } @catch (NSException *e) {
-        wrLog([NSString stringWithFormat:@"touch hook EXC %@", e.name]);
-    }
-}
-
+// v0.25 前台真值=渲染帧流：切走/锁屏时 iOS 暂停后台渲染，帧流断流。
+// Immortalizer 伪造得了状态字段，伪造不了 render server。0.24 实测：切走瞬间归零。
 static BOOL WRUserLookingAtWeChat(void) {
-    if (WRLastTouchAt <= 0) return NO; // 冷启动后未触摸过：不在看
-    return ([[NSDate date] timeIntervalSince1970] - WRLastTouchAt) < 90.0;
+    if (!WRFrameTapInst) return NO; // 帧探针未起（理论不发生）：宁可多弹不吞
+    NSTimeInterval age = [[NSDate date] timeIntervalSince1970] - WRFrameTapInst.lastFrameAt;
+    return age < 2.0; // ProMotion 最低 10Hz：在看时帧龄不超 0.4s，2s 裕量
 }
 
 static NSString *WRAvatarCacheFile(NSString *wxid) {
@@ -450,8 +371,8 @@ static void WRPostBanner(NSString *title, NSString *body, NSString *threadId) {
 static void WRPostBannerInner(NSString *title, NSString *body, NSString *threadId) {
     @try {
         BOOL looking = WRUserLookingAtWeChat();
-        wrLog([NSString stringWithFormat:@"banner: decide touchAge=%.0fs looking=%d ('%@')",
-              WRLastTouchAt > 0 ? [[NSDate date] timeIntervalSince1970] - WRLastTouchAt : -1, looking, title ?: @""]);
+        wrLog([NSString stringWithFormat:@"banner: decide frameAge=%.2fs looking=%d ('%@')",
+              WRFrameTapInst ? [[NSDate date] timeIntervalSince1970] - WRFrameTapInst.lastFrameAt : -1, looking, title ?: @""]);
         if (looking) { wrLog(@"banner: user in WeChat — skip"); return; }
         Class UNC = objc_getClass("UNUserNotificationCenter");
         if (!UNC) { wrLog(@"banner: no UNUserNotificationCenter"); return; }
@@ -730,8 +651,6 @@ __attribute__((constructor)) static void wxrelaySenderCtor(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             WRResolveSelfWxid(); // 等微信联系人服务就绪
             WRReportScenePIDToFile(); // v0.8 保活：场景就绪后立即上报
-            WRInstallTouchHook(); // v0.22 触摸真值
-            WRProbeStart(); // 探针：场景真值记录
             WRProbeFrameStart(); // v0.24：帧流探针
             WRAddWillPresent(); // 模块C：delegate 已注册，就地装载
         });
